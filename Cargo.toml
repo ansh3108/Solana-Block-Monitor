@@ -1,0 +1,16 @@
+[package]
+name = "solana-block-monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+
+solana-client = "1.18"
+solana-sdk = "1.18"
+
+tokio = { version = "1.37", features = ["full"] }
+futures = "0.3"
+
+anyhow = "1.0"
