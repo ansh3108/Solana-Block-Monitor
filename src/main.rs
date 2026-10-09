@@ -1,15 +1,19 @@
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use std::io::{self, stdout};
+use std::{io::{
+    self, stdout
+}, time::Duration};
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
@@ -20,35 +24,40 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal);
+    let result = run_app(&mut terminal);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("Application error: {:?}", err);
-    }
-
-    Ok(());
+    result
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
     loop {
-        terminal.draw(|f| ui(f))?;
+        terminal.draw(|frame| ui(frame))?;
 
-        event::read()?;
-
-        if(Event::Key(key) == KeyCode::Char('q')) {
-            break;
-        } 
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') {
+                    break;
+                }
+            }
+        }
     }
-}
 
+    Ok(())
+}
 
 fn ui(frame: &mut Frame) {
-    Paragraph::new("Waiting for Solana data...").block(Block::default().title("Solana Block Monitor").borders(Borders::ALL));
+    let paragraph = Paragraph::new("Waiting for solana data...")
+        .block(
+            Block::default()
+                .title("Solana Block Monitor")
+                .borders(Borders::ALL),
+    );
 
-    frame.render_widget(my_paragraph, frame.size());
-
+    frame.render_widget(paragraph, frame.size());
 }
