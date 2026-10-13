@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -46,9 +46,13 @@ impl AppState {
 }
 
 enum MonitorEvent {
+    Connecting { attempt: u32 },
+
     Connected,
     Slot(u64),
     Error(String),
+    Reconnecting { delay_secs: u64 },
+
     Disconnected,
 }
 
@@ -82,38 +86,75 @@ fn main() -> Result<()> {
 }
 
 async fn run_slot_monitor(sender: UnboundedSender<MonitorEvent>) {
-    let client = match PubsubClient::new(RPC_WS_URL).await {
-        Ok(client) => client,
-        Err(error) => {
-            let _ = sender.send(MonitorEvent::Error(format!(
-                "WebSocket connection failed: {error}"
-            )));
+    let mut retry_delay_secs = 1_u64;
+    let mut attempt = 0_u32;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+
+        if sender.send(MonitorEvent::Connecting { attempt }).is_err() {
             return;
         }
-    };
 
-    let (mut slot_stream, unsubscribe) = match client.slot_subscribe().await {
-        Ok(subscription) => subscription,
-        Err(error) => {
-            let _ = sender.send(MonitorEvent::Error(format!(
-                "Slot subscription failed: {error}"
-            )));
+        let result = monitor_once(&sender).await;
+
+        match result {
+            Ok(()) => {
+                let _ = sender.send(MonitorEvent::Disconnected);
+            }
+            Err(error) => {
+                if sender
+                    .send(MonitorEvent::Error(format!("{error:#}")))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        if sender
+            .send(MonitorEvent::Reconnecting {
+                delay_secs: retry_delay_secs,
+            })
+            .is_err()
+        {
             return;
         }
-    };
 
-    let _ = sender.send(MonitorEvent::Connected);
+        tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+
+        retry_delay_secs = (retry_delay_secs * 2).min(30);
+    }
+}
+
+async fn monitor_once(sender: &UnboundedSender<MonitorEvent>) -> Result<()> {
+    let client = PubsubClient::new(RPC_WS_URL)
+        .await
+        .context("WebSocket connection failed")?;
+
+    let (mut slot_stream, unsubscribe) = client
+        .slot_subscribe()
+        .await
+        .context("Slot subscription failed")?;
+
+    if sender.send(MonitorEvent::Connected).is_err() {
+        drop(slot_stream);
+        unsubscribe().await;
+        return Ok(());
+    }
 
     while let Some(slot_info) = slot_stream.next().await {
         if sender.send(MonitorEvent::Slot(slot_info.slot)).is_err() {
-            break;
+            drop(slot_stream);
+            unsubscribe().await;
+            return Ok(());
         }
     }
 
     drop(slot_stream);
     unsubscribe().await;
 
-    let _ = sender.send(MonitorEvent::Disconnected);
+    anyhow::bail!("Slot subscription stream ended unexpectedly")
 }
 
 fn add_recent_event(app: &mut AppState, message: String) {
@@ -130,6 +171,10 @@ fn run_app(
     loop {
         while let Ok(event) = receiver.try_recv() {
             match event {
+                MonitorEvent::Connecting { attempt } => {
+                    app.connection_status = format!("Connecting (attempt {attempt})");
+                }
+
                 MonitorEvent::Connected => {
                     app.connection_status = String::from("Connected");
 
@@ -143,15 +188,19 @@ fn run_app(
                 }
 
                 MonitorEvent::Error(message) => {
-                    app.connection_status = String::from("Connection error");
+                    add_recent_event(app, format!("Connection error: {message}"));
+                }
 
-                    add_recent_event(app, message);
+                MonitorEvent::Reconnecting { delay_secs } => {
+                    app.connection_status = format!("Reconnecting in {delay_secs}s");
+
+                    add_recent_event(app, format!("Retry scheduled in {delay_secs}s"));
                 }
 
                 MonitorEvent::Disconnected => {
                     app.connection_status = String::from("Disconnected");
 
-                    add_recent_event(app, String::from("Slot subscription ended"));
+                    add_recent_event(app, String::from("Slot listener stopped"));
                 }
             }
         }
