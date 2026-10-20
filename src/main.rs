@@ -10,37 +10,38 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Sparkline},
 };
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
     nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
-    rpc_config::{RpcAccountInfoConfig, RpcBlockConfig},
+    rpc_config::RpcAccountInfoConfig,
 };
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
-use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
     io::{self, stdout},
-    sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::{
-    Semaphore,
-    mpsc::{UnboundedReceiver, UnboundedSender},
-};
-
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 const RPC_WS_URL: &str = "wss://api.mainnet-beta.solana.com";
 const RPC_HTTP_URL: &str = "https://api.mainnet-beta.solana.com";
-const TPS_WINDOW_SECS: u64 = 10;
+
+const PERFORMANCE_SAMPLE_LIMIT: usize = 10;
+const TPS_HISTORY_LIMIT: usize = 30;
+const TPS_POLL_INTERVAL_SECS: u64 = 15;
 
 struct AppState {
     latest_slot: Option<u64>,
 
     tps: Option<f64>,
-    tps_samples: VecDeque<(Instant, usize)>,
-    first_tps_sample_at: Option<Instant>,
+    non_vote_tps: Option<f64>,
+    tps_history: VecDeque<u64>,
+    tps_status: String,
+    tps_sample_slot: Option<u64>,
+    tps_sample_transactions: Option<u64>,
+    tps_sample_period_secs: Option<u16>,
 
     connection_status: String,
     rpc_endpoint: String,
@@ -62,8 +63,12 @@ impl AppState {
         Self {
             latest_slot: None,
             tps: None,
-            tps_samples: VecDeque::new(),
-            first_tps_sample_at: None,
+            non_vote_tps: None,
+            tps_history: VecDeque::new(),
+            tps_status: String::from("Waiting for RPC sample"),
+            tps_sample_slot: None,
+            tps_sample_transactions: None,
+            tps_sample_period_secs: None,
             connection_status: String::from("Connecting..."),
             rpc_endpoint: String::from(RPC_WS_URL),
             recent_events: Vec::new(),
@@ -90,10 +95,13 @@ enum MonitorEvent {
         delay_secs: u64,
     },
     Disconnected,
-    BlockTransactions {
+    PerformanceSample {
         slot: u64,
-        count: usize,
+        transactions: u64,
+        non_vote_transactions: Option<u64>,
+        period_secs: u16,
     },
+    PerformanceError(String),
     PdaStatus(String),
     PdaUpdate {
         slot: u64,
@@ -123,6 +131,8 @@ fn main() -> Result<()> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<MonitorEvent>();
 
     runtime.spawn(run_slot_monitor(sender.clone()));
+
+    runtime.spawn(run_tps_monitor(sender.clone()));
 
     if let Some((pda, bump)) = pda_config {
         app.target_pda = Some(pda.to_string());
@@ -169,9 +179,6 @@ fn configured_pda() -> Result<Option<(Pubkey, u8)>> {
 }
 
 async fn run_slot_monitor(sender: UnboundedSender<MonitorEvent>) {
-    let rpc_client = Arc::new(RpcClient::new(RPC_HTTP_URL.to_string()));
-    let block_fetch_semaphore = Arc::new(Semaphore::new(4));
-
     let mut retry_delay_secs = 1_u64;
     let mut attempt = 0_u32;
 
@@ -182,14 +189,7 @@ async fn run_slot_monitor(sender: UnboundedSender<MonitorEvent>) {
             return;
         }
 
-        let result = monitor_once(
-            &sender,
-            Arc::clone(&rpc_client),
-            Arc::clone(&block_fetch_semaphore),
-        )
-        .await;
-
-        match result {
+        match monitor_slots_once(&sender).await {
             Ok(()) => return,
             Err(error) => {
                 if sender
@@ -215,14 +215,10 @@ async fn run_slot_monitor(sender: UnboundedSender<MonitorEvent>) {
     }
 }
 
-async fn monitor_once(
-    sender: &UnboundedSender<MonitorEvent>,
-    rpc_client: Arc<RpcClient>,
-    block_fetch_semaphore: Arc<Semaphore>,
-) -> Result<()> {
+async fn monitor_slots_once(sender: &UnboundedSender<MonitorEvent>) -> Result<()> {
     let client = PubsubClient::new(RPC_WS_URL)
         .await
-        .context("WebSocket connection failed")?;
+        .context("Slot WebSocket connection failed")?;
 
     let (mut slot_stream, unsubscribe) = client
         .slot_subscribe()
@@ -236,58 +232,66 @@ async fn monitor_once(
     }
 
     while let Some(slot_info) = slot_stream.next().await {
-        let slot = slot_info.slot;
-
-        if sender.send(MonitorEvent::Slot(slot)).is_err() {
-            break;
+        if sender.send(MonitorEvent::Slot(slot_info.slot)).is_err() {
+            drop(slot_stream);
+            unsubscribe().await;
+            return Ok(());
         }
-
-        let rpc = Arc::clone(&rpc_client);
-        let semaphore = Arc::clone(&block_fetch_semaphore);
-        let event_sender = sender.clone();
-
-        tokio::spawn(async move {
-            let _permit = match semaphore.acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => return,
-            };
-
-            for retry in 0..5_u64 {
-                if retry > 0 {
-                    tokio::time::sleep(Duration::from_millis(250 * retry)).await;
-                }
-
-                let config = RpcBlockConfig {
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    transaction_details: Some(TransactionDetails::Signatures),
-                    rewards: Some(false),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                    max_supported_transaction_version: Some(0),
-                };
-
-                match rpc.get_block_with_config(slot, config).await {
-                    Ok(block) => {
-                        let count = match block.signatures.as_ref() {
-                            Some(signatures) => signatures.len(),
-                            None => match block.transactions.as_ref() {
-                                Some(transactions) => transactions.len(),
-                                None => continue,
-                            },
-                        };
-
-                        let _ = event_sender.send(MonitorEvent::BlockTransactions { slot, count });
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
     }
 
     drop(slot_stream);
     unsubscribe().await;
     let _ = sender.send(MonitorEvent::Disconnected);
     anyhow::bail!("Slot subscription stream ended unexpectedly")
+}
+
+async fn run_tps_monitor(sender: UnboundedSender<MonitorEvent>) {
+    let client = RpcClient::new(RPC_HTTP_URL.to_string());
+    let mut last_sample_slot: Option<u64> = None;
+
+    loop {
+        match client
+            .get_recent_performance_samples(Some(PERFORMANCE_SAMPLE_LIMIT))
+            .await
+        {
+            Ok(mut samples) => {
+                samples.reverse();
+
+                for sample in samples {
+                    if sample.sample_period_secs == 0 {
+                        continue;
+                    }
+
+                    if last_sample_slot.is_some_and(|last| sample.slot <= last) {
+                        continue;
+                    }
+
+                    let event = MonitorEvent::PerformanceSample {
+                        slot: sample.slot,
+                        transactions: sample.num_transactions,
+                        non_vote_transactions: sample.num_non_vote_transactions,
+                        period_secs: sample.sample_period_secs,
+                    };
+
+                    if sender.send(event).is_err() {
+                        return;
+                    }
+
+                    last_sample_slot = Some(sample.slot);
+                }
+            }
+            Err(error) => {
+                if sender
+                    .send(MonitorEvent::PerformanceError(format!("{error:#}")))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(TPS_POLL_INTERVAL_SECS)).await;
+    }
 }
 
 async fn run_pda_monitor(pda: Pubkey, sender: UnboundedSender<MonitorEvent>) {
@@ -377,33 +381,6 @@ fn add_recent_event(app: &mut AppState, message: String) {
     app.recent_events.truncate(8);
 }
 
-fn refresh_tps(app: &mut AppState) {
-    let now = Instant::now();
-    let window = Duration::from_secs(TPS_WINDOW_SECS);
-
-    while let Some((sample_time, _)) = app.tps_samples.front() {
-        if now.duration_since(*sample_time) <= window {
-            break;
-        }
-        app.tps_samples.pop_front();
-    }
-
-    let Some(first_sample_at) = app.first_tps_sample_at else {
-        app.tps = None;
-        return;
-    };
-
-    let elapsed_secs = now
-        .duration_since(first_sample_at)
-        .as_secs_f64()
-        .min(window.as_secs_f64())
-        .max(1.0);
-
-    let total_transactions: usize = app.tps_samples.iter().map(|(_, count)| *count).sum();
-
-    app.tps = Some(total_transactions as f64 / elapsed_secs);
-}
-
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
@@ -423,23 +400,47 @@ fn run_app(
                     app.latest_slot = Some(slot);
                 }
                 MonitorEvent::Error(message) => {
-                    add_recent_event(app, format!("Connection error: {message}"));
+                    add_recent_event(app, format!("Slot connection error: {message}"));
                 }
                 MonitorEvent::Reconnecting { delay_secs } => {
                     app.connection_status = format!("Reconnecting in {delay_secs}s");
-                    add_recent_event(app, format!("Retry scheduled in {delay_secs}s"));
+                    add_recent_event(app, format!("Slot retry scheduled in {delay_secs}s"));
                 }
                 MonitorEvent::Disconnected => {
                     app.connection_status = String::from("Disconnected");
                     add_recent_event(app, String::from("Slot listener stopped"));
                 }
-                MonitorEvent::BlockTransactions { slot, count } => {
-                    let now = Instant::now();
-                    if app.first_tps_sample_at.is_none() {
-                        app.first_tps_sample_at = Some(now);
+                MonitorEvent::PerformanceSample {
+                    slot,
+                    transactions,
+                    non_vote_transactions,
+                    period_secs,
+                } => {
+                    let period = f64::from(period_secs);
+                    app.tps = Some(transactions as f64 / period);
+                    app.non_vote_tps = non_vote_transactions.map(|count| count as f64 / period);
+                    app.tps_sample_slot = Some(slot);
+                    app.tps_sample_transactions = Some(transactions);
+                    app.tps_sample_period_secs = Some(period_secs);
+                    app.tps_status = String::from("RPC performance sample received");
+
+                    let rounded_tps = app.tps.unwrap_or_default().round() as u64;
+                    app.tps_history.push_back(rounded_tps);
+                    while app.tps_history.len() > TPS_HISTORY_LIMIT {
+                        app.tps_history.pop_front();
                     }
-                    app.tps_samples.push_back((now, count));
-                    add_recent_event(app, format!("Block {slot}: {count} transactions"));
+
+                    add_recent_event(
+                        app,
+                        format!(
+                            "TPS sample: {transactions} tx / {period_secs}s = {:.1} TPS",
+                            app.tps.unwrap_or_default()
+                        ),
+                    );
+                }
+                MonitorEvent::PerformanceError(message) => {
+                    app.tps_status = String::from("RPC sample request failed");
+                    add_recent_event(app, format!("TPS RPC error: {message}"));
                 }
                 MonitorEvent::PdaStatus(status) => {
                     app.pda_status = status;
@@ -483,7 +484,6 @@ fn run_app(
             }
         }
 
-        refresh_tps(app);
         terminal.draw(|frame| ui(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -527,7 +527,6 @@ fn ui(frame: &mut Frame, app: &AppState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(columns[0]);
 
-    // Three right-side panels: activity, connection and PDA state.
     let right_panels = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -548,16 +547,43 @@ fn ui(frame: &mut Frame, app: &AppState) {
     );
     frame.render_widget(slot_panel, left_panels[0]);
 
-    let tps_text = match app.tps {
-        Some(tps) => format!("Observed TPS: {tps:.2}\nRolling window: up to 10s"),
-        None => String::from("Waiting for block transaction data..."),
+    let tps_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(3)])
+        .split(left_panels[1]);
+
+    let total_tps = app
+        .tps
+        .map(|value| format!("{value:.1} TPS"))
+        .unwrap_or_else(|| String::from("Waiting for sample"));
+    let non_vote_tps = app
+        .non_vote_tps
+        .map(|value| format!("{value:.1} TPS"))
+        .unwrap_or_else(|| String::from("Unavailable"));
+    let sample_details = match (app.tps_sample_transactions, app.tps_sample_period_secs) {
+        (Some(transactions), Some(period)) => format!("Sample: {transactions} tx / {period}s"),
+        _ => app.tps_status.clone(),
     };
-    let tps_panel = Paragraph::new(tps_text).block(
+    let tps_summary = Paragraph::new(format!(
+        "Total: {total_tps}\nNon-vote: {non_vote_tps}\n{sample_details}"
+    ))
+    .block(
         Block::default()
             .title(" Network Throughput ")
             .borders(Borders::ALL),
     );
-    frame.render_widget(tps_panel, left_panels[1]);
+    frame.render_widget(tps_summary, tps_layout[0]);
+
+    let history: Vec<u64> = app.tps_history.iter().copied().collect();
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .title(" TPS History (about 60s per sample) ")
+                .borders(Borders::ALL),
+        )
+        .data(history.as_slice())
+        .style(Style::default().fg(Color::Green));
+    frame.render_widget(sparkline, tps_layout[1]);
 
     let activity_text = if app.recent_events.is_empty() {
         String::from("Waiting for network activity...")
@@ -572,7 +598,7 @@ fn ui(frame: &mut Frame, app: &AppState) {
     frame.render_widget(activity_panel, right_panels[0]);
 
     let connection_text = format!(
-        "Status: {}\nRPC: {}",
+        "Status: {}\nWebSocket: {}",
         app.connection_status, app.rpc_endpoint
     );
     let connection_panel = Paragraph::new(connection_text)
@@ -584,17 +610,17 @@ fn ui(frame: &mut Frame, app: &AppState) {
         app.target_pda.as_deref().unwrap_or("Not configured"),
         app.pda_status,
         app.pda_lamports
-            .map(|v| v.to_string())
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "--".into()),
         app.pda_data_len
-            .map(|v| v.to_string())
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "--".into()),
         app.pda_owner.as_deref().unwrap_or("--"),
         app.pda_executable
-            .map(|v| v.to_string())
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "--".into()),
         app.pda_last_slot
-            .map(|v| v.to_string())
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "--".into()),
     );
     let pda_panel = Paragraph::new(pda_text).block(
