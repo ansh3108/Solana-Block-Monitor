@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -718,6 +718,11 @@ fn run_app(
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Ignore key-release events to prevent duplicate characters.
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+
                 if app.pda_input_mode {
                     // In input mode, every typed character belongs to the address.
                     match key.code {
