@@ -11,9 +11,10 @@ tokio = { version = "1.37", features = ["full"] }
 futures = "0.3"
 
 solana-client = "1.18"
-
-anyhow = "1.0"
-
 solana-sdk = "1.18"
+solana-program = "1.18"
 solana-transaction-status = "1.18"
 solana-account-decoder = "1.18"
+spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
+
+anyhow = "1.0"
